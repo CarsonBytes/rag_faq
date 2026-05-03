@@ -4,6 +4,7 @@ import nest_asyncio
 import asyncio
 import logging
 import time
+import threading
 
 MODEL_VOL_PATH = "/models"
 INDEX_VOL_PATH = "/index_store"
@@ -11,6 +12,7 @@ INDEX_VOL_PATH = "/index_store"
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def build_llama_cpp_cuda():
     import subprocess
@@ -35,6 +37,15 @@ def build_llama_cpp_cuda():
         "pip", "install", "llama-index-llms-llama-cpp", "--no-cache-dir"
     ])
 
+def download_models():
+    """Pre-download embedding model weights into image cache.
+    The 2 GB GGUF is loaded at runtime into GPU memory and preserved
+    via Modal's memory snapshot — no volume needed."""
+    from sentence_transformers import SentenceTransformer
+    # 22M model, loads in <1s from disk during snapshot creation.
+    _ = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    print("Embedding model pre-downloaded")
+
 # Use NVIDIA CUDA devel image so nvcc is available during image build.
 # Modal docs explicitly recommend this for libraries that need CUDA toolkit.
 image = (
@@ -44,19 +55,27 @@ image = (
     )
     .entrypoint([])  # removes chatty prints on entry
     .apt_install("git", "build-essential", "cmake", "curl", "wget", "patchelf")
+    # Install CPU-only torch FIRST — embeddings (bge-small-en-v1.5) are tiny and fast
+    # on CPU.  Avoids NCCL symbol conflicts with nvidia/cuda:12.4.0-devel system libs.
+    .pip_install(
+        "torch",
+        extra_options="--index-url https://download.pytorch.org/whl/cpu",
+    )
     .pip_install(
         "llama-index",
         "llama-index-embeddings-huggingface",
         "huggingface_hub",
+        "sentence-transformers",  # needed for download_models
         "fastapi[standard]",
         "python-multipart",
         "nest-asyncio",
     )
+    .run_function(download_models)
     .run_function(build_llama_cpp_cuda, gpu="T4")
 )
 
-model_volume = modal.Volume.from_name("llamacpp-models", create_if_missing=True)
-index_volume = modal.Volume.from_name("rag-index-store", create_if_missing=True)
+index_volume = modal.Volume.from_name(
+    "rag-index-store", create_if_missing=True)
 
 app = modal.App(name="llamacpp-rag-backend", image=image)
 
@@ -64,7 +83,8 @@ app = modal.App(name="llamacpp-rag-backend", image=image)
 _llm = None
 _embed_model = None
 _index_cache = None
-_model_lock = asyncio.Lock()
+_model_lock = threading.Lock()
+
 
 def get_llm():
     global _llm
@@ -82,7 +102,6 @@ def get_llm():
             local_dir=MODEL_VOL_PATH,
             local_dir_use_symlinks=False,
         )
-        model_volume.commit()
 
     _llm = LlamaCPP(
         model_path=model_path,
@@ -105,6 +124,7 @@ def get_llm():
         logger.warning("Could not verify GPU offload — may be running on CPU!")
     return _llm
 
+
 def get_embed_model():
     global _embed_model
     if _embed_model is not None:
@@ -113,6 +133,7 @@ def get_embed_model():
     _embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
     logger.info("Embedding model loaded successfully.")
     return _embed_model
+
 
 def get_or_load_index():
     global _index_cache
@@ -126,44 +147,39 @@ def get_or_load_index():
     logger.info("Index loaded from storage.")
     return _index_cache
 
-@app.function(
+
+@app.cls(
     gpu="T4",
-    volumes={MODEL_VOL_PATH: model_volume, INDEX_VOL_PATH: index_volume},
+    volumes={INDEX_VOL_PATH: index_volume},
     max_containers=1,
-    min_containers=1,
+    min_containers=0,
+    scaledown_window=120,
     timeout=600,
+    enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.asgi_app()
-def fastapi_app():
-    nest_asyncio.apply()
-    from fastapi import FastAPI, UploadFile, File, HTTPException
-    from pydantic import BaseModel
-    from llama_index.core import Document, VectorStoreIndex, Settings
-    from contextlib import asynccontextmanager
+class RAGBackend:
+    """Modal class with GPU memory snapshot for instant cold starts."""
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        logger.info("Container starting up...")
-        # Preload lightweight embed model; set Settings so index ops never fallback to OpenAI.
-        embed_model = await asyncio.to_thread(get_embed_model)
-        Settings.embed_model = embed_model
-        logger.info(f"Embed model ready: {type(embed_model).__name__}")
-        llm = await asyncio.to_thread(get_llm)
-        Settings.llm = llm
-        logger.info(f"LLM ready: {type(llm).__name__}")
-        yield
-        logger.info("Container shutting down...")
+    @modal.enter(snap=True)
+    def load(self):
+        """Preload models into GPU/RAM once; Modal snapshots the memory state."""
+        import nest_asyncio
+        nest_asyncio.apply()
+        from llama_index.core import Settings
+        Settings.llm = get_llm()
+        Settings.embed_model = get_embed_model()
+        logger.info(
+            f"Snapshot-ready: llm={type(Settings.llm).__name__}, "
+            f"embed={type(Settings.embed_model).__name__}"
+        )
 
-    web_app = FastAPI(title="Qwen 2.5 RAG API", lifespan=lifespan)
-
-    # ---------- 健康检查（总是可用） ----------
-    @web_app.get("/health")
-    async def health():
+    @modal.fastapi_endpoint(method="GET", label="health")
+    def health(self):
         return {"status": "ok", "message": "Backend is alive"}
 
-    @web_app.get("/debug")
-    async def debug():
+    @modal.fastapi_endpoint(method="GET", label="debug")
+    def debug(self):
         """Inspect current Settings to verify embed model is not OpenAI."""
         from llama_index.core import Settings as S
         return {
@@ -172,105 +188,99 @@ def fastapi_app():
             "embed_module": str(S.embed_model.__class__.__module__) if S.embed_model else None,
         }
 
-    class QueryRequest(BaseModel):
-        question: str
-
-    # ---------- 上传文档（按需加载模型） ----------
-    @web_app.post("/upload")
-    async def upload(file: UploadFile = File(...)):
+    # ---------- 上传文档 ----------
+    @modal.fastapi_endpoint(method="POST", label="upload")
+    async def upload(self, payload: dict):
+        """POST JSON body: {"text": "...", "filename": "doc.txt"}"""
         global _index_cache
+        text = payload.get("text", "")
+        filename = payload.get("filename", "document.txt")
         try:
-            content = await file.read()
-            text = content.decode("utf-8")
-            if not text.strip():
-                raise HTTPException(status_code=400, detail="File is empty")
+            if not text or not text.strip():
+                return {"status": "error", "message": "Empty text"}
 
-            async with _model_lock:
-                # llama-cpp-python is not thread-safe; run blocking init in thread
-                llm = await asyncio.to_thread(get_llm)
-                embed_model = await asyncio.to_thread(get_embed_model)
+            def _do_upload():
+                global _index_cache
+                llm = get_llm()
+                embed_model = get_embed_model()
+                from llama_index.core import Settings, Document, VectorStoreIndex
                 Settings.llm = llm
                 Settings.embed_model = embed_model
-                logger.info(f"Upload Settings: llm={type(llm).__name__}, embed={type(embed_model).__name__}")
-
-                doc = Document(text=text, id_=file.filename)
-                # Explicitly pass embed_model so index is bound to HuggingFace, not OpenAI
-                index = await asyncio.to_thread(
-                    VectorStoreIndex.from_documents,
-                    [doc],
-                    embed_model=embed_model,
+                logger.info(
+                    f"Upload Settings: llm={type(llm).__name__}, "
+                    f"embed={type(embed_model).__name__}"
                 )
-                await asyncio.to_thread(index.storage_context.persist, persist_dir=INDEX_VOL_PATH)
-                await index_volume.commit.aio()
+                doc = Document(text=text, id_=filename)
+                index = VectorStoreIndex.from_documents(
+                    [doc], embed_model=embed_model,
+                )
+                index.storage_context.persist(persist_dir=INDEX_VOL_PATH)
                 _index_cache = index
+                return len(text)
 
-            return {"status": "success", "message": f"Indexed {len(text)} characters"}
+            with _model_lock:
+                text_len = await asyncio.to_thread(_do_upload)
+            await index_volume.commit.aio()
+            return {"status": "success", "message": f"Indexed {text_len} characters"}
         except Exception as e:
             logger.exception("Upload failed")
-            raise HTTPException(status_code=500, detail=str(e))
+            return {"status": "error", "message": str(e)}
 
-    # ---------- 查询（按需加载模型和索引） ----------
-    @web_app.post("/query")
-    async def query(req: QueryRequest):
+    # ---------- 查询 ----------
+    @modal.fastapi_endpoint(method="POST", label="query")
+    async def query(self, payload: dict):
+        """POST JSON body: {"question": "..."}"""
+        question = payload.get("question", "")
+        if not question:
+            return {"answer": "Missing 'question' in JSON body."}
         try:
-            # Ensure embed model is in Settings BEFORE any index load
-            # (load_index_from_storage may resolve defaults if Settings is empty)
-            embed_model = await asyncio.to_thread(get_embed_model)
-            Settings.embed_model = embed_model
-            logger.info(f"Query Settings.embed_model set to {type(embed_model).__name__}")
+            # Ensure Settings.embed_model is set BEFORE any index load
+            def _prepare():
+                embed_model = get_embed_model()
+                from llama_index.core import Settings
+                Settings.embed_model = embed_model
+                return embed_model
+
+            embed_model = await asyncio.to_thread(_prepare)
+            logger.info(
+                f"Query Settings.embed_model set to {type(embed_model).__name__}"
+            )
 
             index = get_or_load_index()
             if index is None:
-                return {"answer": "No document uploaded. Please upload a .txt file first."}
+                return {
+                    "answer": "No document uploaded. Please upload a .txt file first."
+                }
 
-            async with _model_lock:
-                llm = await asyncio.to_thread(get_llm)
+            def _do_query():
+                llm = get_llm()
+                from llama_index.core import Settings
                 Settings.llm = llm
                 logger.info(f"Query Settings.llm set to {type(llm).__name__}")
-
-                # compact = single LLM call; avoid refine/tree_summarize which make multiple calls
-                # Settings.llm is already set above; as_query_engine picks it up automatically
                 query_engine = index.as_query_engine(
                     similarity_top_k=2,
                     response_mode="compact",
                 )
-                logger.info(f"Running query: {req.question}")
+                logger.info(f"Running query: {question}")
                 t0 = time.time()
-                response = await asyncio.to_thread(query_engine.query, req.question)
+                response = query_engine.query(question)
                 t1 = time.time()
                 answer = str(response).strip()
                 logger.info(f"Query answered in {t1-t0:.1f}s: {answer[:200]}...")
+                return answer
+
+            with _model_lock:
+                answer = await asyncio.to_thread(_do_query)
 
             if not answer or answer == "None":
-                return {"answer": "I couldn't find a relevant answer. Please try a different question."}
+                return {
+                    "answer": "I couldn't find a relevant answer. Please try a different question."
+                }
             return {"answer": answer}
         except Exception as e:
             logger.exception("Query failed")
             return {"answer": f"Backend error: {str(e)}"}
 
-    return web_app
-
-# ---------- 可选预热（注释掉 schedule） ----------
-@app.function(
-    gpu="T4",
-    volumes={MODEL_VOL_PATH: model_volume},
-    # schedule=modal.Period(seconds=300),   # 需要保活可以取消注释
-)
-def keep_warm():
-    from llama_index.core import Settings
-    Settings.llm = get_llm()
-    Settings.embed_model = get_embed_model()
-    _ = Settings.llm.complete("ping")
-    print("Keep warm: container kept alive")
-
-@app.function(
-    gpu="T4",
-    volumes={MODEL_VOL_PATH: model_volume},
-    timeout=300,
-)
-def warmup_model():
-    from llama_index.core import Settings
-    Settings.llm = get_llm()
-    Settings.embed_model = get_embed_model()
-    _ = Settings.llm.complete("Hello")
-    print("Warmup completed")
+# GPU snapshots eliminate the need for keep_warm / warmup_model functions.
+# The @modal.enter(snap=True) hook in RAGBackend.load() handles model preloading
+# and Modal restores GPU memory state on every cold start.
