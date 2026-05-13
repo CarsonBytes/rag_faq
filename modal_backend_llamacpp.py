@@ -176,7 +176,19 @@ class RAGBackend:
 
     @modal.fastapi_endpoint(method="GET", label="health")
     def health(self):
-        return {"status": "ok", "message": "Backend is alive"}
+        index_file_exists = os.path.exists(f"{INDEX_VOL_PATH}/docstore.json")
+        filename = None
+        if index_file_exists:
+            try:
+                index = get_or_load_index()
+                if index and index.docstore.docs:
+                    # Try to get original filename from metadata first
+                    doc_id = list(index.docstore.docs.keys())[0]
+                    doc = index.docstore.get_document(doc_id)
+                    filename = doc.metadata.get("original_filename", doc_id) if doc else doc_id
+            except Exception:
+                pass
+        return {"status": "ok", "message": "Backend is alive", "index_exists": index_file_exists, "indexed_filename": filename}
 
     @modal.fastapi_endpoint(method="GET", label="debug")
     def debug(self):
@@ -210,7 +222,8 @@ class RAGBackend:
                     f"Upload Settings: llm={type(llm).__name__}, "
                     f"embed={type(embed_model).__name__}"
                 )
-                doc = Document(text=text, id_=filename)
+                # Store original filename in metadata
+                doc = Document(text=text, id_=filename, metadata={"original_filename": filename})
                 index = VectorStoreIndex.from_documents(
                     [doc], embed_model=embed_model,
                 )
