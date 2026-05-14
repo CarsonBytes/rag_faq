@@ -1,2 +1,4 @@
 gradio
 requests
+pypdf
+python-docx

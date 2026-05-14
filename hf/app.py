@@ -245,20 +245,75 @@ def _upload_text(text_content: str, filename: str) -> Tuple[bool, Optional[str],
         return False, None, None, f"❌ Upload failed: {str(e)}"
 
 
-def upload_document(file_obj) -> Tuple[bool, Optional[str], Optional[int], str]:
+def _extract_pdf_text(path: str) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    parts = []
+    for page in reader.pages:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n\n".join(parts)
+
+
+def _extract_docx_text(path: str) -> str:
+    import docx
+    doc = docx.Document(path)
+    paragraphs = [p.text for p in doc.paragraphs if p.text]
+    # Also pull text from tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text:
+                    paragraphs.append(cell.text)
+    return "\n\n".join(paragraphs)
+
+
+def extract_text_from_file(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (text, error). Supports .txt, .pdf, .docx."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".txt":
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read(), None
+        if ext == ".pdf":
+            return _extract_pdf_text(path), None
+        if ext == ".docx":
+            return _extract_docx_text(path), None
+        return None, f"❌ Unsupported file type: {ext}. Use .txt, .pdf, or .docx."
+    except UnicodeDecodeError:
+        return None, "❌ Could not decode .txt file. Please use UTF-8 encoding."
+    except Exception as e:
+        return None, f"❌ Failed to read {ext} file: {e}"
+
+
+def _resolve_file_path(file_obj) -> Optional[str]:
+    """gr.File may return a str path (Gradio 6+) or an object with .name (older)."""
     if file_obj is None:
+        return None
+    if isinstance(file_obj, str):
+        return file_obj
+    return getattr(file_obj, "name", None) or getattr(file_obj, "path", None)
+
+
+def upload_document(file_obj) -> Tuple[bool, Optional[str], Optional[int], str]:
+    path = _resolve_file_path(file_obj)
+    if not path:
         return False, None, None, "❌ No file selected."
-    file_size = os.path.getsize(file_obj.name) if os.path.exists(file_obj.name) else 0
+    if not os.path.exists(path):
+        return False, None, None, f"❌ File not found: {path}"
+    file_size = os.path.getsize(path)
     if file_size > MAX_FILE_SIZE:
         return False, None, None, f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}."
-    try:
-        with open(file_obj.name, "r", encoding="utf-8") as f:
-            text_content = f.read()
-    except UnicodeDecodeError:
-        return False, None, None, "❌ Could not decode file. Please use a UTF-8 text file."
+    text_content, err = extract_text_from_file(path)
+    if err:
+        return False, None, None, err
     if not text_content or not text_content.strip():
-        return False, None, None, "❌ File is empty."
-    filename = os.path.basename(file_obj.name)
+        return False, None, None, "❌ File is empty or no extractable text found."
+    base = os.path.basename(path)
+    stem, _ext = os.path.splitext(base)
+    filename = f"{stem}.txt"
     return _upload_text(text_content, filename)
 
 
@@ -457,9 +512,13 @@ def create_app() -> gr.Blocks:
                     yield history + [user_msg, {"role": "assistant", "content": final_answer}], ""
 
             # Returns (indexed?, filename, char_count, display_md, preview_text)
-            def _after_index(success, filename, char_count, source_text):
-                display = update_index_display(filename, success, char_count)
-                preview = source_text if success else ""
+            def _after_index(success, filename, char_count, source_text, error_msg=""):
+                if success:
+                    display = update_index_display(filename, success, char_count)
+                    preview = source_text or ""
+                else:
+                    display = error_msg or "📄 *No document indexed yet*"
+                    preview = ""
                 return success, filename, char_count, display, preview
 
             # ── Section 1: Select files to index ──────────────────────────
@@ -493,9 +552,13 @@ def create_app() -> gr.Blocks:
                     # — Tab C: upload file —
                     with gr.Tab("📁 Upload file"):
                         file_input = gr.File(
-                            label="Upload .txt file",
-                            file_types=[".txt"],
+                            label="Upload .txt, .pdf, or .docx",
+                            file_types=[".txt", ".pdf", ".docx"],
                             file_count="single",
+                        )
+                        gr.Markdown(
+                            "<small style='color:#888'>PDF and DOCX are parsed in-browser; "
+                            "only the extracted text is sent to the backend.</small>"
                         )
                         upload_btn = gr.Button("🚀 Index Uploaded File", variant="primary")
 
@@ -530,9 +593,9 @@ def create_app() -> gr.Blocks:
 
             # ── Wiring for Section 1 actions ──────────────────────────────
             def _samples_action(selected_labels):
-                success, filename, char_count, _msg = load_selected_samples(selected_labels)
+                success, filename, char_count, msg = load_selected_samples(selected_labels)
                 source_text = build_preview_text(selected_labels)[0] if success else ""
-                return _after_index(success, filename, char_count, source_text)
+                return _after_index(success, filename, char_count, source_text, msg)
 
             load_samples_btn.click(
                 fn=_samples_action,
@@ -541,8 +604,8 @@ def create_app() -> gr.Blocks:
             )
 
             def _paste_action(text, filename):
-                success, fn_used, char_count, _msg = upload_pasted_text(text, filename)
-                return _after_index(success, fn_used, char_count, text if success else "")
+                success, fn_used, char_count, msg = upload_pasted_text(text, filename)
+                return _after_index(success, fn_used, char_count, text if success else "", msg)
 
             load_paste_btn.click(
                 fn=_paste_action,
@@ -551,15 +614,13 @@ def create_app() -> gr.Blocks:
             )
 
             def _upload_action(file_obj):
-                success, fn_used, char_count, _msg = upload_document(file_obj)
+                success, fn_used, char_count, msg = upload_document(file_obj)
                 source_text = ""
-                if success and file_obj is not None and os.path.exists(file_obj.name):
-                    try:
-                        with open(file_obj.name, "r", encoding="utf-8") as f:
-                            source_text = f.read()
-                    except Exception:
-                        source_text = ""
-                return _after_index(success, fn_used, char_count, source_text)
+                path = _resolve_file_path(file_obj)
+                if success and path and os.path.exists(path):
+                    extracted, _err = extract_text_from_file(path)
+                    source_text = extracted or ""
+                return _after_index(success, fn_used, char_count, source_text, msg)
 
             upload_btn.click(
                 fn=_upload_action,
