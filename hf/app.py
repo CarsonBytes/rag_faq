@@ -200,9 +200,7 @@ def format_file_size(size_bytes: int) -> str:
 
 
 def clean_answer(answer: str) -> str:
-    if '[INST]' in answer:
-        answer = answer[:answer.index('[INST]')]
-    for marker in ['<<SYS>>', '<</SYS>>', '<</SYS']:
+    for marker in ['[/INST]', '[INST]', '<<SYS>>', '<</SYS>>', '<</SYS', '</s>', '<|im_end|>', '<|im_start|>']:
         if marker in answer:
             answer = answer[:answer.index(marker)]
     return answer.strip()
@@ -493,8 +491,6 @@ def create_app() -> gr.Blocks:
                 """
             )
 
-            index_status = gr.Markdown("📄 *No document indexed yet*")
-
             # Define respond up-front so any button below can reference it
             def respond(message, history, is_indexed):
                 history = history or []
@@ -533,6 +529,7 @@ def create_app() -> gr.Blocks:
                             interactive=True,
                         )
                         load_samples_btn = gr.Button("🚀 Index Selected Reports", variant="primary")
+                        samples_status = gr.Markdown("")
 
                     # — Tab B: paste text —
                     with gr.Tab("✏️ Paste text"):
@@ -548,8 +545,9 @@ def create_app() -> gr.Blocks:
                             lines=1,
                         )
                         load_paste_btn = gr.Button("🚀 Index Pasted Text", variant="primary")
+                        paste_status = gr.Markdown("")
 
-                    # — Tab C: upload file —
+                    # — Tab C: upload file (no button — auto-indexes on upload) —
                     with gr.Tab("📁 Upload file"):
                         file_input = gr.File(
                             label="Upload .txt, .pdf, or .docx",
@@ -558,18 +556,20 @@ def create_app() -> gr.Blocks:
                         )
                         gr.Markdown(
                             "<small style='color:#888'>PDF and DOCX are parsed in-browser; "
-                            "only the extracted text is sent to the backend.</small>"
+                            "only the extracted text is sent to the backend. "
+                            "Indexing starts automatically once a file is selected.</small>"
                         )
-                        upload_btn = gr.Button("🚀 Index Uploaded File", variant="primary")
+                        upload_status = gr.Markdown("")
 
             # ── Section 2: Preview indexed text ───────────────────────────
-            with gr.Accordion("📖 2. Preview indexed text", open=False):
+            with gr.Accordion("📖 2. Preview indexed text", open=True):
+                index_status = gr.Markdown("📄 *No document indexed yet*")
                 preview_box = gr.Textbox(
                     value="",
                     lines=18,
                     max_lines=18,
                     interactive=False,
-                    show_label=False,
+                    label="Content",
                     placeholder="Index a document in section 1 to see its content here.",
                 )
 
@@ -592,40 +592,112 @@ def create_app() -> gr.Blocks:
                     send_btn = gr.Button("Send ▶", scale=1, variant="primary")
 
             # ── Wiring for Section 1 actions ──────────────────────────────
+            SAMPLES_LABEL = "🚀 Index Selected Reports"
+            PASTE_LABEL   = "🚀 Index Pasted Text"
+
+            def _busy(label):
+                return gr.update(value=label, interactive=False)
+
+            def _ready(label):
+                return gr.update(value=label, interactive=True)
+
+            # Outputs for each action (button OR status, then state, then index/preview)
+            # Samples & paste: [btn, status_md, indexed, filename, char_count, index_status, preview_box]
+            # Upload (no btn): [status_md, indexed, filename, char_count, index_status, preview_box]
+
             def _samples_action(selected_labels):
+                yield _busy("📖 Preparing reports..."), "📖 Preparing reports…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                if not selected_labels:
+                    indexed, fn_used, cc, display, preview = _after_index(
+                        False, None, None, "", "⚠️ Please select at least one report."
+                    )
+                    yield _ready(SAMPLES_LABEL), "⚠️ Please select at least one report.", indexed, fn_used, cc, display, preview
+                    return
+                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
                 success, filename, char_count, msg = load_selected_samples(selected_labels)
                 source_text = build_preview_text(selected_labels)[0] if success else ""
-                return _after_index(success, filename, char_count, source_text, msg)
+                indexed, fn_used, cc, display, preview = _after_index(
+                    success, filename, char_count, source_text, msg
+                )
+                final_status = "✅ Done." if success else msg
+                yield _ready(SAMPLES_LABEL), final_status, indexed, fn_used, cc, display, preview
 
             load_samples_btn.click(
                 fn=_samples_action,
                 inputs=[sample_selector],
-                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[load_samples_btn, samples_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
             )
 
             def _paste_action(text, filename):
+                yield _busy("📖 Preparing text..."), "📖 Preparing text…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                if not text or not text.strip():
+                    indexed, fn_used, cc, display, preview = _after_index(
+                        False, None, None, "", "⚠️ Please paste some text first."
+                    )
+                    yield _ready(PASTE_LABEL), "⚠️ Please paste some text first.", indexed, fn_used, cc, display, preview
+                    return
+                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
                 success, fn_used, char_count, msg = upload_pasted_text(text, filename)
-                return _after_index(success, fn_used, char_count, text if success else "", msg)
+                indexed, fn_used2, cc, display, preview = _after_index(
+                    success, fn_used, char_count, text if success else "", msg
+                )
+                final_status = "✅ Done." if success else msg
+                yield _ready(PASTE_LABEL), final_status, indexed, fn_used2, cc, display, preview
 
             load_paste_btn.click(
                 fn=_paste_action,
                 inputs=[paste_input, paste_filename],
-                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[load_paste_btn, paste_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
             )
 
             def _upload_action(file_obj):
-                success, fn_used, char_count, msg = upload_document(file_obj)
-                source_text = ""
+                # 1) Parsing
+                yield "📖 Parsing file…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
                 path = _resolve_file_path(file_obj)
-                if success and path and os.path.exists(path):
-                    extracted, _err = extract_text_from_file(path)
-                    source_text = extracted or ""
-                return _after_index(success, fn_used, char_count, source_text, msg)
+                if not path:
+                    indexed, fn_used, cc, display, preview = _after_index(
+                        False, None, None, "", "❌ No file selected."
+                    )
+                    yield "❌ No file selected.", indexed, fn_used, cc, display, preview
+                    return
+                if not os.path.exists(path):
+                    indexed, fn_used, cc, display, preview = _after_index(
+                        False, None, None, "", f"❌ File not found: {path}"
+                    )
+                    yield f"❌ File not found.", indexed, fn_used, cc, display, preview
+                    return
+                file_size = os.path.getsize(path)
+                if file_size > MAX_FILE_SIZE:
+                    indexed, fn_used, cc, display, preview = _after_index(
+                        False, None, None, "", f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}."
+                    )
+                    yield f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}.", indexed, fn_used, cc, display, preview
+                    return
 
-            upload_btn.click(
+                text_content, err = extract_text_from_file(path)
+                if err or not text_content or not text_content.strip():
+                    err_msg = err or "❌ File is empty or no extractable text found."
+                    indexed, fn_used, cc, display, preview = _after_index(False, None, None, "", err_msg)
+                    yield err_msg, indexed, fn_used, cc, display, preview
+                    return
+
+                # 2) Uploading + indexing
+                yield "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                base = os.path.basename(path)
+                stem, _ext = os.path.splitext(base)
+                filename = f"{stem}.txt"
+                success, fn_used, char_count, msg = _upload_text(text_content, filename)
+                indexed, fn_used2, cc, display, preview = _after_index(
+                    success, fn_used, char_count, text_content if success else "", msg
+                )
+                final_status = f"✅ Indexed **{fn_used2}** ({char_count:,} characters)." if success else msg
+                yield final_status, indexed, fn_used2, cc, display, preview
+
+            # Trigger automatically when the user uploads a file
+            file_input.upload(
                 fn=_upload_action,
                 inputs=[file_input],
-                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[upload_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
             )
 
             # Quick-question buttons: fill the textbox, then auto-submit

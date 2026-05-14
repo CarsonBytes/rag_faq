@@ -164,7 +164,7 @@ def get_or_load_index():
 
 def _truncate_at_prompt_markers(text: str) -> str:
     """Strip any leaked prompt-template text the model appended to its answer."""
-    for marker in ("[INST]", "<<SYS>>", "<</SYS>>", "<</SYS"):
+    for marker in ("[/INST]", "[INST]", "<<SYS>>", "<</SYS>>", "<</SYS", "</s>", "<|im_end|>", "<|im_start|>"):
         if marker in text:
             text = text[:text.index(marker)]
     return text.strip()
