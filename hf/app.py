@@ -7,7 +7,6 @@ import requests
 import os
 import time
 import threading
-import re
 from typing import Optional, Generator, Tuple
 
 # ---------- Configuration Constants ----------
@@ -18,13 +17,20 @@ BACKEND_URLS = {
     "health": "https://carsonbytes--health.modal.run/",
 }
 
-WARMUP_TIMEOUT = 15  # seconds
-QUERY_TIMEOUT = 60   # seconds
-UPLOAD_TIMEOUT = 120  # seconds
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
-MAX_QUESTION_LENGTH = 1000  # characters
+WARMUP_TIMEOUT = 15
+QUERY_TIMEOUT = 60
+UPLOAD_TIMEOUT = 120
+MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_QUESTION_LENGTH = 1000
 
 # ---------- Sample Annual Reports ----------
+SAMPLE_LABELS = {
+    "Annual Report 2023": 2023,
+    "Annual Report 2024": 2024,
+    "Annual Report 2025": 2025,
+    "Annual Report 2026": 2026,
+}
+
 SAMPLE_DOCUMENTS = {
     2023: """\
 TechVision Corp — Annual Report 2023
@@ -202,7 +208,7 @@ def clean_answer(answer: str) -> str:
     return answer.strip()
 
 
-# ---------- Backend Communication Functions ----------
+# ---------- Backend Communication ----------
 def check_health() -> Tuple[bool, Optional[str], Optional[int]]:
     """Returns (index_exists, indexed_filename, indexed_char_count)."""
     try:
@@ -220,7 +226,6 @@ def check_health() -> Tuple[bool, Optional[str], Optional[int]]:
 
 
 def _upload_text(text_content: str, filename: str) -> Tuple[bool, Optional[str], Optional[int], str]:
-    """Core upload logic shared by file upload and sample loaders."""
     payload = {"text": text_content, "filename": filename}
     try:
         response = requests.post(
@@ -233,8 +238,7 @@ def _upload_text(text_content: str, filename: str) -> Tuple[bool, Optional[str],
         if data.get("status") == "success":
             char_count = data.get("char_count")
             return True, filename, char_count, f"✅ Indexed **{filename}**"
-        else:
-            return False, None, None, f"❌ {data.get('message', 'Upload failed')}"
+        return False, None, None, f"❌ {data.get('message', 'Upload failed')}"
     except requests.exceptions.Timeout:
         return False, None, None, "❌ Upload timed out. Please try a smaller file."
     except Exception as e:
@@ -242,43 +246,68 @@ def _upload_text(text_content: str, filename: str) -> Tuple[bool, Optional[str],
 
 
 def upload_document(file_obj) -> Tuple[bool, Optional[str], Optional[int], str]:
-    """Upload a user-selected .txt file."""
     if file_obj is None:
         return False, None, None, "❌ No file selected."
-
     file_size = os.path.getsize(file_obj.name) if os.path.exists(file_obj.name) else 0
     if file_size > MAX_FILE_SIZE:
-        return False, None, None, f"❌ File too large. Maximum size is {format_file_size(MAX_FILE_SIZE)}."
-
+        return False, None, None, f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}."
     try:
         with open(file_obj.name, "r", encoding="utf-8") as f:
             text_content = f.read()
     except UnicodeDecodeError:
         return False, None, None, "❌ Could not decode file. Please use a UTF-8 text file."
-
     if not text_content or not text_content.strip():
         return False, None, None, "❌ File is empty."
-
     filename = os.path.basename(file_obj.name)
     return _upload_text(text_content, filename)
 
 
-def load_sample_document(year: int) -> Tuple[bool, Optional[str], Optional[int], str]:
-    """Upload a built-in sample annual report."""
-    text = SAMPLE_DOCUMENTS[year]
-    filename = f"annual_report_{year}.txt"
+def upload_pasted_text(text: str, filename: str = "pasted.txt") -> Tuple[bool, Optional[str], Optional[int], str]:
+    """Index user-pasted text directly."""
+    if not text or not text.strip():
+        return False, None, None, "⚠️ Please paste some text first."
+    filename = (filename or "pasted.txt").strip() or "pasted.txt"
+    if not filename.endswith(".txt"):
+        filename += ".txt"
     return _upload_text(text, filename)
+
+
+def load_selected_samples(selected_labels: list) -> Tuple[bool, Optional[str], Optional[int], str]:
+    """Combine and upload one or more sample annual reports."""
+    if not selected_labels:
+        return False, None, None, "⚠️ Please select at least one report."
+    years = sorted([SAMPLE_LABELS[lbl] for lbl in selected_labels])
+    parts = []
+    for year in years:
+        separator = "=" * 60
+        parts.append(f"{separator}\nANNUAL REPORT {year}\n{separator}\n{SAMPLE_DOCUMENTS[year]}")
+    combined = "\n\n".join(parts)
+    if len(years) == 1:
+        filename = f"annual_report_{years[0]}.txt"
+    else:
+        filename = f"annual_reports_{'_'.join(str(y) for y in years)}.txt"
+    return _upload_text(combined, filename)
+
+
+def build_preview_text(selected_labels: list) -> Tuple[str, str]:
+    """Return (text, text) — same value for the visible textbox and hidden state."""
+    if not selected_labels:
+        return "", ""
+    years = sorted([SAMPLE_LABELS[lbl] for lbl in selected_labels])
+    parts = []
+    for year in years:
+        separator = "=" * 60
+        parts.append(f"{separator}\nANNUAL REPORT {year}\n{separator}\n{SAMPLE_DOCUMENTS[year]}")
+    text = "\n\n".join(parts)
+    return text, text
 
 
 def query_backend(message: str) -> Generator[str, None, None]:
     if not message or not message.strip():
         return
-
     if len(message) > MAX_QUESTION_LENGTH:
         message = message[:MAX_QUESTION_LENGTH]
-
     yield "🤔 Thinking..."
-
     try:
         response = requests.post(
             get_backend_url("query"),
@@ -287,13 +316,11 @@ def query_backend(message: str) -> Generator[str, None, None]:
         )
         response.raise_for_status()
         data = response.json()
-
         answer = clean_answer(data.get("answer", "⚠️ Received an empty response."))
         elapsed = data.get("elapsed")
         if elapsed is not None:
             answer += f"\n\n<sub style='color:#888'>⏱️ {elapsed:.1f} seconds</sub>"
         yield answer
-
     except requests.exceptions.Timeout:
         yield "❌ Query timed out. Please try again."
     except requests.exceptions.ConnectionError:
@@ -305,22 +332,20 @@ def query_backend(message: str) -> Generator[str, None, None]:
 def update_index_display(filename: Optional[str], is_indexed: bool, char_count: Optional[int] = None) -> str:
     if is_indexed and filename:
         detail = f" ({char_count:,} characters)" if char_count else ""
-        return f"📄 **Indexed Document:** {filename}{detail}"
+        return f"📄 **Indexed** {filename}{detail}"
     elif is_indexed:
-        return "📄 **Indexed Document:** ✅ Document indexed (filename unknown)"
-    return "📄 **Indexed Document:** None"
+        return "📄 **Indexed** (document ready)"
+    return "📄 *No document indexed yet*"
 
 
 def load_index_state() -> Tuple[bool, Optional[str], Optional[int], str]:
     is_indexed, filename, char_count = check_health()
-    display = update_index_display(filename, is_indexed, char_count)
-    return is_indexed, filename, char_count, display
+    return is_indexed, filename, char_count, update_index_display(filename, is_indexed, char_count)
 
 
 def warmup_with_status(start_time: float = None) -> Generator[Tuple[str, bool, str, float], None, None]:
     if start_time is None:
         start_time = time.time()
-
     result = {"done": False, "success": False, "status_code": None, "error": None}
 
     def do_request():
@@ -333,15 +358,13 @@ def warmup_with_status(start_time: float = None) -> Generator[Tuple[str, bool, s
         finally:
             result["done"] = True
 
-    thread = threading.Thread(target=do_request, daemon=True)
-    thread.start()
+    threading.Thread(target=do_request, daemon=True).start()
 
-    # Simulated step messages keyed by elapsed-time thresholds
     STEPS = [
-        (0,   "⏳ Initializing GPU model (Qwen 2.5 3B)..."),
-        (3,   "⏳ Initializing GPU model (Qwen 2.5 3B)...\n✅ Embedding model ready (BGE-small)"),
-        (6,   "⏳ Initializing GPU model (Qwen 2.5 3B)...\n✅ Embedding model ready (BGE-small)\n⏳ Loading index from volume..."),
-        (9,   "✅ GPU model loaded (Qwen 2.5 3B)\n✅ Embedding model ready (BGE-small)\n⏳ Loading index from volume..."),
+        (0, "⏳ Initializing GPU model (Qwen 2.5 3B)..."),
+        (3, "⏳ Initializing GPU model (Qwen 2.5 3B)...\n✅ Embedding model ready (BGE-small)"),
+        (6, "⏳ Initializing GPU model (Qwen 2.5 3B)...\n✅ Embedding model ready (BGE-small)\n⏳ Loading index from volume..."),
+        (9, "✅ GPU model loaded (Qwen 2.5 3B)\n✅ Embedding model ready (BGE-small)\n⏳ Loading index from volume..."),
     ]
 
     while not result["done"]:
@@ -350,25 +373,22 @@ def warmup_with_status(start_time: float = None) -> Generator[Tuple[str, bool, s
         for threshold, msg in STEPS:
             if elapsed >= threshold:
                 step_msg = msg
-        status = f"{step_msg}\n\n*({elapsed:.1f}s elapsed)*"
-        yield status, False, f"⏳ Warming up... ({elapsed:.1f}s)", start_time
+        yield f"{step_msg}\n\n*({elapsed:.1f}s elapsed)*", False, f"⏳ Warming up... ({elapsed:.1f}s)", start_time
         time.sleep(1)
 
     elapsed = time.time() - start_time
     if result["success"]:
         final = (
-            f"✅ GPU model loaded (Qwen 2.5 3B)\n"
-            f"✅ Embedding model ready (BGE-small)\n"
-            f"✅ Index volume ready\n\n"
+            "✅ GPU model loaded (Qwen 2.5 3B)\n"
+            "✅ Embedding model ready (BGE-small)\n"
+            "✅ Index volume ready\n\n"
             f"**✅ Backend ready in {elapsed:.1f}s**"
         )
         yield final, True, f"✅ Ready ({elapsed:.1f}s)", start_time
     elif result["error"]:
-        msg = f"❌ Cannot connect: {result['error']} ({elapsed:.1f}s)"
-        yield msg, False, f"❌ Failed ({elapsed:.1f}s)", start_time
+        yield f"❌ Cannot connect: {result['error']} ({elapsed:.1f}s)", False, f"❌ Failed ({elapsed:.1f}s)", start_time
     else:
-        msg = f"❌ Backend returned status {result['status_code']} ({elapsed:.1f}s)"
-        yield msg, False, f"❌ Failed ({elapsed:.1f}s)", start_time
+        yield f"❌ Backend returned status {result['status_code']} ({elapsed:.1f}s)", False, f"❌ Failed ({elapsed:.1f}s)", start_time
 
 
 # ---------- Main App ----------
@@ -379,7 +399,7 @@ def create_app() -> gr.Blocks:
         indexed_filename = gr.State(None)
         indexed_char_count = gr.State(None)
 
-        # --- Warmup page ---
+        # ── Warmup page ──────────────────────────────────────────────────────
         with gr.Column(elem_id="warmup-page") as warmup_page:
             gr.Markdown(
                 """
@@ -391,14 +411,9 @@ def create_app() -> gr.Blocks:
                 </div>
                 """
             )
-
             with gr.Row():
                 with gr.Column():
-                    warmup_btn = gr.Button(
-                        "🔥 Warm Up Backend",
-                        variant="primary",
-                        size="lg",
-                    )
+                    warmup_btn = gr.Button("🔥 Warm Up Backend", variant="primary", size="lg")
 
             warmup_status = gr.Markdown("")
             ready = gr.State(False)
@@ -406,117 +421,185 @@ def create_app() -> gr.Blocks:
 
             warmup_btn.click(
                 fn=lambda: time.time(),
-                outputs=[start_time_state]
+                outputs=[start_time_state],
             ).then(
                 fn=warmup_with_status,
                 inputs=[start_time_state],
-                outputs=[warmup_status, ready, warmup_btn, start_time_state]
+                outputs=[warmup_status, ready, warmup_btn, start_time_state],
             )
 
-        # --- Chat page (initially hidden) ---
+        # ── Chat page ────────────────────────────────────────────────────────
         with gr.Column(elem_id="chat-page", visible=False) as chat_page:
             gr.Markdown(
                 """
-                <div style="text-align: center; margin-bottom: 2em;">
+                <div style="text-align: center; margin-bottom: 1em;">
                     <h1>📚 RAG Chat Interface</h1>
-                    <p style="color: #666;">Upload a document or load a sample report, then ask questions.</p>
                 </div>
                 """
             )
 
-            with gr.Row():
-                index_status = gr.Markdown("📄 **Indexed Document:** None")
+            index_status = gr.Markdown("📄 *No document indexed yet*")
 
-            # --- Sample document loader ---
-            gr.Markdown("### 📋 Load Sample Annual Report")
-            with gr.Row():
-                sample_2023_btn = gr.Button("📄 Load Sample: Annual Report 2023")
-                sample_2024_btn = gr.Button("📄 Load Sample: Annual Report 2024")
-                sample_2025_btn = gr.Button("📄 Load Sample: Annual Report 2025")
-                sample_2026_btn = gr.Button("📄 Load Sample: Annual Report 2026")
+            # Define respond up-front so any button below can reference it
+            def respond(message, history, is_indexed):
+                history = history or []
+                if not message or not message.strip():
+                    yield history, message
+                    return
+                user_msg = {"role": "user", "content": message}
+                if not is_indexed:
+                    yield history + [user_msg, {"role": "assistant", "content": "⚠️ Please index a document first (see section 1)."}], ""
+                    return
+                yield history + [user_msg, {"role": "assistant", "content": "🤔 Thinking..."}], ""
+                final_answer = "🤔 Thinking..."
+                for chunk in query_backend(message):
+                    final_answer = chunk
+                    yield history + [user_msg, {"role": "assistant", "content": final_answer}], ""
 
-            sample_status = gr.Markdown("")
-
-            def _make_sample_loader(year):
-                def loader():
-                    return load_sample_document(year)
-                return loader
-
-            def _on_sample_done(success, filename, char_count, message):
+            # Returns (indexed?, filename, char_count, display_md, preview_text)
+            def _after_index(success, filename, char_count, source_text):
                 display = update_index_display(filename, success, char_count)
-                return success, filename, char_count, message, display
+                preview = source_text if success else ""
+                return success, filename, char_count, display, preview
 
-            for btn, year in [
-                (sample_2023_btn, 2023),
-                (sample_2024_btn, 2024),
-                (sample_2025_btn, 2025),
-                (sample_2026_btn, 2026),
-            ]:
-                btn.click(
-                    fn=_make_sample_loader(year),
-                    outputs=[document_indexed, indexed_filename, indexed_char_count, sample_status]
-                ).then(
-                    fn=_on_sample_done,
-                    inputs=[document_indexed, indexed_filename, indexed_char_count, sample_status],
-                    outputs=[document_indexed, indexed_filename, indexed_char_count, sample_status, index_status]
+            # ── Section 1: Select files to index ──────────────────────────
+            with gr.Accordion("📥 1. Select files to index", open=True):
+                with gr.Tabs():
+                    # — Tab A: sample files —
+                    with gr.Tab("📋 Sample reports"):
+                        sample_selector = gr.CheckboxGroup(
+                            choices=list(SAMPLE_LABELS.keys()),
+                            value=[],
+                            label="Pick one or more sample annual reports",
+                            interactive=True,
+                        )
+                        load_samples_btn = gr.Button("🚀 Index Selected Reports", variant="primary")
+
+                    # — Tab B: paste text —
+                    with gr.Tab("✏️ Paste text"):
+                        paste_input = gr.Textbox(
+                            label="Paste text here",
+                            lines=10,
+                            max_lines=20,
+                            placeholder="Paste any text content you want to ask questions about…",
+                        )
+                        paste_filename = gr.Textbox(
+                            label="Filename (optional)",
+                            value="pasted.txt",
+                            lines=1,
+                        )
+                        load_paste_btn = gr.Button("🚀 Index Pasted Text", variant="primary")
+
+                    # — Tab C: upload file —
+                    with gr.Tab("📁 Upload file"):
+                        file_input = gr.File(
+                            label="Upload .txt file",
+                            file_types=[".txt"],
+                            file_count="single",
+                        )
+                        upload_btn = gr.Button("🚀 Index Uploaded File", variant="primary")
+
+            # ── Section 2: Preview indexed text ───────────────────────────
+            with gr.Accordion("📖 2. Preview indexed text", open=False):
+                preview_box = gr.Textbox(
+                    value="",
+                    lines=18,
+                    max_lines=18,
+                    interactive=False,
+                    show_label=False,
+                    placeholder="Index a document in section 1 to see its content here.",
                 )
 
-            gr.Markdown("### 📁 Or Upload Your Own Document")
-            with gr.Row():
-                with gr.Column(scale=2):
-                    file_input = gr.File(
-                        label="Upload .txt file",
-                        file_types=[".txt"],
-                        file_count="single",
-                        show_label=True,
+            # ── Section 3: Chat ────────────────────────────────────────────
+            with gr.Accordion("💬 3. Ask questions", open=True):
+                gr.Markdown("<small style='color:#888'>Quick questions:</small>")
+                with gr.Row():
+                    q_btns = [gr.Button(q, size="sm") for q in SAMPLE_QUESTIONS]
+
+                chatbot = gr.Chatbot(height=420, show_label=False, value=[])
+
+                with gr.Row():
+                    question_input = gr.Textbox(
+                        placeholder="Type your question and press Enter…",
+                        lines=1,
+                        scale=9,
+                        show_label=False,
+                        container=False,
                     )
-                with gr.Column(scale=1):
-                    upload_btn = gr.Button("📤 Build Index", variant="primary", size="lg")
+                    send_btn = gr.Button("Send ▶", scale=1, variant="primary")
 
-            with gr.Row():
-                upload_status = gr.Markdown("**Status:** Waiting for document...")
+            # ── Wiring for Section 1 actions ──────────────────────────────
+            def _samples_action(selected_labels):
+                success, filename, char_count, _msg = load_selected_samples(selected_labels)
+                source_text = build_preview_text(selected_labels)[0] if success else ""
+                return _after_index(success, filename, char_count, source_text)
 
-            def _on_upload_done(success, filename, char_count, message):
-                display = update_index_display(filename, success, char_count)
-                return success, filename, char_count, message, display
+            load_samples_btn.click(
+                fn=_samples_action,
+                inputs=[sample_selector],
+                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+            )
+
+            def _paste_action(text, filename):
+                success, fn_used, char_count, _msg = upload_pasted_text(text, filename)
+                return _after_index(success, fn_used, char_count, text if success else "")
+
+            load_paste_btn.click(
+                fn=_paste_action,
+                inputs=[paste_input, paste_filename],
+                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+            )
+
+            def _upload_action(file_obj):
+                success, fn_used, char_count, _msg = upload_document(file_obj)
+                source_text = ""
+                if success and file_obj is not None and os.path.exists(file_obj.name):
+                    try:
+                        with open(file_obj.name, "r", encoding="utf-8") as f:
+                            source_text = f.read()
+                    except Exception:
+                        source_text = ""
+                return _after_index(success, fn_used, char_count, source_text)
 
             upload_btn.click(
-                fn=upload_document,
+                fn=_upload_action,
                 inputs=[file_input],
-                outputs=[document_indexed, indexed_filename, indexed_char_count, upload_status]
-            ).then(
-                fn=_on_upload_done,
-                inputs=[document_indexed, indexed_filename, indexed_char_count, upload_status],
-                outputs=[document_indexed, indexed_filename, indexed_char_count, upload_status, index_status]
+                outputs=[document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
             )
 
-            gr.Markdown("### 💬 Ask Questions")
+            # Quick-question buttons: fill the textbox, then auto-submit
+            for btn, q in zip(q_btns, SAMPLE_QUESTIONS):
+                btn.click(
+                    fn=lambda x=q: x,
+                    outputs=[question_input],
+                ).then(
+                    fn=respond,
+                    inputs=[question_input, chatbot, document_indexed],
+                    outputs=[chatbot, question_input],
+                )
 
-            def chat_wrapper(message: str, history: list, is_indexed: bool) -> Generator[str, None, None]:
-                if not is_indexed:
-                    yield "⚠️ Please upload a document or load a sample report first."
-                    return
-                yield from query_backend(message)
-
-            gr.ChatInterface(
-                fn=chat_wrapper,
-                additional_inputs=[document_indexed],
-                title=None,
-                description=None,
-                examples=SAMPLE_QUESTIONS,
+            send_btn.click(
+                fn=respond,
+                inputs=[question_input, chatbot, document_indexed],
+                outputs=[chatbot, question_input],
+            )
+            question_input.submit(
+                fn=respond,
+                inputs=[question_input, chatbot, document_indexed],
+                outputs=[chatbot, question_input],
             )
 
-        # Switch pages when warmup completes
+        # Page switch when warmup completes
         ready.change(
             fn=lambda r: (gr.update(visible=not r), gr.update(visible=r), "chat" if r else "warmup"),
             inputs=[ready],
-            outputs=[warmup_page, chat_page, page]
+            outputs=[warmup_page, chat_page, page],
         )
 
-        # On page load, check /health and populate index state for chat page
+        # Restore index state on page load
         demo.load(
             fn=load_index_state,
-            outputs=[document_indexed, indexed_filename, indexed_char_count, index_status]
+            outputs=[document_indexed, indexed_filename, indexed_char_count, index_status],
         )
 
     return demo

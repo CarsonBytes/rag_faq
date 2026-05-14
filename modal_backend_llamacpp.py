@@ -317,10 +317,22 @@ class RAGBackend:
 
         def _do_query():
             from llama_index.core import Settings
+            from llama_index.core import PromptTemplate
             Settings.llm = get_llm()
+            concise_qa = PromptTemplate(
+                "Context information is below.\n"
+                "---------------------\n"
+                "{context_str}\n"
+                "---------------------\n"
+                "Answer the question in 2-3 sentences maximum. Be direct and concise — "
+                "no preamble, no restating the question, no closing remarks.\n"
+                "Question: {query_str}\n"
+                "Answer: "
+            )
             query_engine = index.as_query_engine(
                 similarity_top_k=2,
                 response_mode="compact",
+                text_qa_template=concise_qa,
             )
             t0 = time.time()
             response = query_engine.query(question)
