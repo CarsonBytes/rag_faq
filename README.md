@@ -3,9 +3,6 @@
 A self-hosted retrieval-augmented Q&A system over uploaded documents.
 **Self-compiled CUDA llama.cpp + LlamaIndex on serverless GPU, behind a Gradio UI on Hugging Face Spaces.**
 
-> Designed and built as a portfolio piece for IT team lead / engineering management roles.
-> The infrastructure choices below — particularly the GPU cold-start optimisation and the unified-index architecture — are the centrepieces, not the code volume.
-
 ---
 
 ## The problem
