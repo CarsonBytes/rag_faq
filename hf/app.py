@@ -1,332 +1,43 @@
 """
-RAG Chat Interface for Hugging Face Space.
-Connects to Modal backend for document indexing and question answering.
+RAG Chat Interface for Hugging Face Space — Gradio UI layer.
+All pure logic and backend HTTP lives in utils.py for testability.
 """
 import gradio as gr
-import requests
 import os
 import time
 import threading
-from typing import Optional, Generator, Tuple
+import requests
+from typing import Generator, Tuple
 
-# ---------- Configuration Constants ----------
-BACKEND_URLS = {
-    "query": "https://carsonbytes--query.modal.run/",
-    "debug": "https://carsonbytes--debug.modal.run/",
-    "upload": "https://carsonbytes--upload.modal.run/",
-    "health": "https://carsonbytes--health.modal.run/",
-}
-
-WARMUP_TIMEOUT = 15
-QUERY_TIMEOUT = 60
-UPLOAD_TIMEOUT = 120
-MAX_FILE_SIZE = 10 * 1024 * 1024
-MAX_QUESTION_LENGTH = 1000
-
-# ---------- Sample Annual Reports ----------
-SAMPLE_LABELS = {
-    "Annual Report 2023": 2023,
-    "Annual Report 2024": 2024,
-    "Annual Report 2025": 2025,
-    "Annual Report 2026": 2026,
-}
-
-SAMPLE_DOCUMENTS = {
-    2023: """\
-TechVision Corp — Annual Report 2023
-
-LETTER TO SHAREHOLDERS
-Dear Shareholders,
-2023 was a year of resilient growth despite macro headwinds. We delivered record revenue
-while investing heavily in our AI platform and expanding into three new markets.
-
-FINANCIAL HIGHLIGHTS
-Total Revenue:        $4.82 billion  (+12% YoY)
-Gross Profit:         $2.17 billion  (45.0% margin)
-Operating Income:     $681 million   (14.1% margin)
-Net Income:           $512 million
-EPS (diluted):        $3.18
-Free Cash Flow:       $743 million
-Headcount (year-end): 18,400
-
-SEGMENT REVENUE
-  Cloud Services:     $2.61B  (+21%)
-  Enterprise Software:$1.44B  (+4%)
-  Professional Svcs:  $0.77B  (+2%)
-
-KEY RISKS
-1. Increasing competition from hyperscale cloud providers threatening Cloud Services margins.
-2. Customer concentration — top 10 clients represent 34% of revenue.
-3. Cybersecurity threats and potential data-breach liability.
-4. Regulatory scrutiny around AI model outputs in the EU (AI Act compliance costs).
-5. Foreign-exchange headwinds: 38% of revenue is denominated in non-USD currencies.
-
-EXECUTIVE LEADERSHIP
-CEO:   Sarah Chen        (since 2019)
-CFO:   Marcus Webb       (since 2021)
-COO:   Priya Nair        (since 2022)
-CTO:   Daniel Kowalski   (since 2020)
-""",
-    2024: """\
-TechVision Corp — Annual Report 2024
-
-LETTER TO SHAREHOLDERS
-Dear Shareholders,
-2024 marked our strongest growth year since IPO. AI-powered features drove record
-adoption in Cloud Services and we completed the acquisition of DataBridge Inc.
-
-FINANCIAL HIGHLIGHTS
-Total Revenue:        $5.74 billion  (+19% YoY)
-Gross Profit:         $2.70 billion  (47.1% margin)
-Operating Income:     $874 million   (15.2% margin)
-Net Income:           $658 million
-EPS (diluted):        $4.07
-Free Cash Flow:       $921 million
-Headcount (year-end): 21,750 (includes ~1,200 from DataBridge acquisition)
-
-SEGMENT REVENUE
-  Cloud Services:     $3.38B  (+30%)
-  Enterprise Software:$1.52B  (+6%)
-  Professional Svcs:  $0.84B  (+9%)
-
-KEY RISKS
-1. Integration risk from DataBridge acquisition — potential system and culture misalignment.
-2. GPU supply constraints limiting AI infrastructure expansion capacity.
-3. Rising interest rates increasing cost of capital for planned data-center builds.
-4. Talent retention — attrition in AI/ML roles reached 14%, above industry average.
-5. Geopolitical risk: 12% of revenue exposed to APAC regions under trade restrictions.
-
-EXECUTIVE LEADERSHIP
-CEO:   Sarah Chen        (since 2019)
-CFO:   Marcus Webb       (since 2021)
-COO:   James Okafor      (joined 2024, replaced Priya Nair)
-CTO:   Daniel Kowalski   (since 2020)
-Chief AI Officer: Lena Park (new role, appointed 2024)
-""",
-    2025: """\
-TechVision Corp — Annual Report 2025
-
-LETTER TO SHAREHOLDERS
-Dear Shareholders,
-2025 was a transformational year. We crossed $7 billion in revenue, launched TechVision AI Studio,
-and completed the full integration of DataBridge. Our AI platform now serves over 6,000 enterprise clients.
-
-FINANCIAL HIGHLIGHTS
-Total Revenue:        $7.11 billion  (+24% YoY)
-Gross Profit:         $3.52 billion  (49.5% margin)
-Operating Income:     $1.14 billion  (16.0% margin)
-Net Income:           $867 million
-EPS (diluted):        $5.36
-Free Cash Flow:       $1.18 billion
-Headcount (year-end): 25,300
-
-SEGMENT REVENUE
-  Cloud Services:     $4.40B  (+30%)
-  Enterprise Software:$1.74B  (+15%)
-  Professional Svcs:  $0.97B  (+15%)
-
-KEY RISKS
-1. Commoditization of AI features — competitors offering similar AI tooling at lower price points.
-2. Regulatory compliance costs (EU AI Act fully effective; NIST AI RMF adoption in US contracts).
-3. Data-center energy costs up 28% YoY, pressuring infrastructure margins.
-4. Concentration in Cloud Services (62% of revenue) increases segment-specific risk exposure.
-5. Macroeconomic slowdown risk — enterprise IT budgets under review in 40% of Fortune 500 accounts.
-
-EXECUTIVE LEADERSHIP
-CEO:   Sarah Chen        (since 2019)
-CFO:   Rachel Torres     (appointed Q2 2025, replaced Marcus Webb)
-COO:   James Okafor      (since 2024)
-CTO:   Daniel Kowalski   (since 2020)
-Chief AI Officer: Lena Park (since 2024)
-""",
-    2026: """\
-TechVision Corp — Annual Report 2026
-
-LETTER TO SHAREHOLDERS
-Dear Shareholders,
-2026 delivered another year of double-digit growth. TechVision AI Studio reached 10,000 enterprise
-deployments and we launched our sovereign-cloud offering in five new countries.
-
-FINANCIAL HIGHLIGHTS
-Total Revenue:        $8.63 billion  (+21% YoY)
-Gross Profit:         $4.40 billion  (51.0% margin)
-Operating Income:     $1.47 billion  (17.0% margin)
-Net Income:           $1.12 billion
-EPS (diluted):        $6.91
-Free Cash Flow:       $1.55 billion
-Headcount (year-end): 28,900
-
-SEGMENT REVENUE
-  Cloud Services:     $5.46B  (+24%)
-  Enterprise Software:$2.07B  (+19%)
-  Professional Svcs:  $1.10B  (+13%)
-
-KEY RISKS
-1. Sovereign-cloud expansion exposes TechVision to new jurisdictional data-residency obligations.
-2. Increasing AI regulation globally — 23 countries now have enacted AI-specific legislation.
-3. Model hallucination liability: three enterprise clients filed claims in 2026 over AI output errors.
-4. Supply-chain risk: sole-source dependency on two semiconductor vendors for proprietary AI chips.
-5. Executive succession planning — CEO Sarah Chen announced intent to transition by end of 2027.
-
-EXECUTIVE LEADERSHIP
-CEO:   Sarah Chen        (since 2019; transition planned for 2027)
-CFO:   Rachel Torres     (since 2025)
-COO:   James Okafor      (since 2024)
-CTO:   Nina Vasquez      (appointed 2026, replaced Daniel Kowalski)
-Chief AI Officer: Lena Park (since 2024)
-""",
-}
-
-SAMPLE_QUESTIONS = [
-    "What was the total revenue in respective years?",
-    "List the top 3 risks mentioned.",
-    "Who are the key executives?",
-    "Sort revenue by year (from highest to lowest)",
-]
+from utils import (
+    BACKEND_URLS,
+    MAX_FILE_SIZE,
+    load_sample_data,
+    get_backend_url,
+    format_file_size,
+    extract_text_from_file,
+    resolve_file_path,
+    check_health,
+    fetch_indexed_docs,
+    upload_text_to_backend,
+    upload_pasted_text,
+    query_backend,
+    update_index_display,
+    load_index_state,
+    delete_document,
+)
 
 
-# ---------- Utility Functions ----------
-def get_backend_url(endpoint: str) -> str:
-    return BACKEND_URLS.get(endpoint, BACKEND_URLS["query"])
+# ---------- Sample Data ----------
+_SAMPLE_DATA = load_sample_data()
+SAMPLE_LABELS: dict    = _SAMPLE_DATA["labels"]
+SAMPLE_DOCUMENTS: dict = {int(k): v for k, v in _SAMPLE_DATA["documents"].items()}
+SAMPLE_QUESTIONS: list = _SAMPLE_DATA["sample_questions"]
 
 
-def format_file_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} bytes"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    else:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
+# ---------- Sample-specific helpers ----------
 
-
-def clean_answer(answer: str) -> str:
-    for marker in ['[/INST]', '[INST]', '<<SYS>>', '<</SYS>>', '<</SYS', '</s>', '<|im_end|>', '<|im_start|>']:
-        if marker in answer:
-            answer = answer[:answer.index(marker)]
-    return answer.strip()
-
-
-# ---------- Backend Communication ----------
-def check_health() -> Tuple[bool, Optional[str], Optional[int]]:
-    """Returns (index_exists, indexed_filename, indexed_char_count)."""
-    try:
-        resp = requests.get(get_backend_url("health"), timeout=WARMUP_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            return (
-                data.get("index_exists", False),
-                data.get("indexed_filename", None),
-                data.get("indexed_char_count", None),
-            )
-        return False, None, None
-    except Exception:
-        return False, None, None
-
-
-def _upload_text(text_content: str, filename: str) -> Tuple[bool, Optional[str], Optional[int], str]:
-    payload = {"text": text_content, "filename": filename}
-    try:
-        response = requests.post(
-            get_backend_url("upload"),
-            json=payload,
-            timeout=UPLOAD_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data.get("status") == "success":
-            char_count = data.get("char_count")
-            return True, filename, char_count, f"✅ Indexed **{filename}**"
-        return False, None, None, f"❌ {data.get('message', 'Upload failed')}"
-    except requests.exceptions.Timeout:
-        return False, None, None, "❌ Upload timed out. Please try a smaller file."
-    except Exception as e:
-        return False, None, None, f"❌ Upload failed: {str(e)}"
-
-
-def _extract_pdf_text(path: str) -> str:
-    from pypdf import PdfReader
-    reader = PdfReader(path)
-    parts = []
-    for page in reader.pages:
-        try:
-            parts.append(page.extract_text() or "")
-        except Exception:
-            continue
-    return "\n\n".join(parts)
-
-
-def _extract_docx_text(path: str) -> str:
-    import docx
-    doc = docx.Document(path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text]
-    # Also pull text from tables
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell.text:
-                    paragraphs.append(cell.text)
-    return "\n\n".join(paragraphs)
-
-
-def extract_text_from_file(path: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return (text, error). Supports .txt, .pdf, .docx."""
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if ext == ".txt":
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read(), None
-        if ext == ".pdf":
-            return _extract_pdf_text(path), None
-        if ext == ".docx":
-            return _extract_docx_text(path), None
-        return None, f"❌ Unsupported file type: {ext}. Use .txt, .pdf, or .docx."
-    except UnicodeDecodeError:
-        return None, "❌ Could not decode .txt file. Please use UTF-8 encoding."
-    except Exception as e:
-        return None, f"❌ Failed to read {ext} file: {e}"
-
-
-def _resolve_file_path(file_obj) -> Optional[str]:
-    """gr.File may return a str path (Gradio 6+) or an object with .name (older)."""
-    if file_obj is None:
-        return None
-    if isinstance(file_obj, str):
-        return file_obj
-    return getattr(file_obj, "name", None) or getattr(file_obj, "path", None)
-
-
-def upload_document(file_obj) -> Tuple[bool, Optional[str], Optional[int], str]:
-    path = _resolve_file_path(file_obj)
-    if not path:
-        return False, None, None, "❌ No file selected."
-    if not os.path.exists(path):
-        return False, None, None, f"❌ File not found: {path}"
-    file_size = os.path.getsize(path)
-    if file_size > MAX_FILE_SIZE:
-        return False, None, None, f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}."
-    text_content, err = extract_text_from_file(path)
-    if err:
-        return False, None, None, err
-    if not text_content or not text_content.strip():
-        return False, None, None, "❌ File is empty or no extractable text found."
-    base = os.path.basename(path)
-    stem, _ext = os.path.splitext(base)
-    filename = f"{stem}.txt"
-    return _upload_text(text_content, filename)
-
-
-def upload_pasted_text(text: str, filename: str = "pasted.txt") -> Tuple[bool, Optional[str], Optional[int], str]:
-    """Index user-pasted text directly."""
-    if not text or not text.strip():
-        return False, None, None, "⚠️ Please paste some text first."
-    filename = (filename or "pasted.txt").strip() or "pasted.txt"
-    if not filename.endswith(".txt"):
-        filename += ".txt"
-    return _upload_text(text, filename)
-
-
-def load_selected_samples(selected_labels: list) -> Tuple[bool, Optional[str], Optional[int], str]:
-    """Combine and upload one or more sample annual reports."""
+def load_selected_samples(selected_labels: list) -> Tuple[bool, str, int, str]:
     if not selected_labels:
         return False, None, None, "⚠️ Please select at least one report."
     years = sorted([SAMPLE_LABELS[lbl] for lbl in selected_labels])
@@ -339,61 +50,18 @@ def load_selected_samples(selected_labels: list) -> Tuple[bool, Optional[str], O
         filename = f"annual_report_{years[0]}.txt"
     else:
         filename = f"annual_reports_{'_'.join(str(y) for y in years)}.txt"
-    return _upload_text(combined, filename)
+    return upload_text_to_backend(combined, filename)
 
 
-def build_preview_text(selected_labels: list) -> Tuple[str, str]:
-    """Return (text, text) — same value for the visible textbox and hidden state."""
+def build_preview_text(selected_labels: list) -> str:
     if not selected_labels:
-        return "", ""
+        return ""
     years = sorted([SAMPLE_LABELS[lbl] for lbl in selected_labels])
     parts = []
     for year in years:
         separator = "=" * 60
         parts.append(f"{separator}\nANNUAL REPORT {year}\n{separator}\n{SAMPLE_DOCUMENTS[year]}")
-    text = "\n\n".join(parts)
-    return text, text
-
-
-def query_backend(message: str) -> Generator[str, None, None]:
-    if not message or not message.strip():
-        return
-    if len(message) > MAX_QUESTION_LENGTH:
-        message = message[:MAX_QUESTION_LENGTH]
-    yield "🤔 Thinking..."
-    try:
-        response = requests.post(
-            get_backend_url("query"),
-            json={"question": message},
-            timeout=QUERY_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        answer = clean_answer(data.get("answer", "⚠️ Received an empty response."))
-        elapsed = data.get("elapsed")
-        if elapsed is not None:
-            answer += f"\n\n<sub style='color:#888'>⏱️ {elapsed:.1f} seconds</sub>"
-        yield answer
-    except requests.exceptions.Timeout:
-        yield "❌ Query timed out. Please try again."
-    except requests.exceptions.ConnectionError:
-        yield "❌ Cannot connect to backend. Please try again later."
-    except Exception as e:
-        yield f"❌ Error: {str(e)}"
-
-
-def update_index_display(filename: Optional[str], is_indexed: bool, char_count: Optional[int] = None) -> str:
-    if is_indexed and filename:
-        detail = f" ({char_count:,} characters)" if char_count else ""
-        return f"📄 **Indexed** {filename}{detail}"
-    elif is_indexed:
-        return "📄 **Indexed** (document ready)"
-    return "📄 *No document indexed yet*"
-
-
-def load_index_state() -> Tuple[bool, Optional[str], Optional[int], str]:
-    is_indexed, filename, char_count = check_health()
-    return is_indexed, filename, char_count, update_index_display(filename, is_indexed, char_count)
+    return "\n\n".join(parts)
 
 
 def warmup_with_status(start_time: float = None) -> Generator[Tuple[str, bool, str, float], None, None]:
@@ -445,12 +113,13 @@ def warmup_with_status(start_time: float = None) -> Generator[Tuple[str, bool, s
 
 
 # ---------- Main App ----------
+
 def create_app() -> gr.Blocks:
     with gr.Blocks() as demo:
-        page = gr.State("warmup")
+        page             = gr.State("warmup")
         document_indexed = gr.State(False)
-        indexed_filename = gr.State(None)
-        indexed_char_count = gr.State(None)
+        indexed_docs     = gr.State([])
+        active_docs      = gr.State([])   # selected docs for query scope; [] = all
 
         # ── Warmup page ──────────────────────────────────────────────────────
         with gr.Column(elem_id="warmup-page") as warmup_page:
@@ -491,8 +160,7 @@ def create_app() -> gr.Blocks:
                 """
             )
 
-            # Define respond up-front so any button below can reference it
-            def respond(message, history, is_indexed):
+            def respond(message, history, is_indexed, current_docs):
                 history = history or []
                 if not message or not message.strip():
                     yield history, message
@@ -503,24 +171,37 @@ def create_app() -> gr.Blocks:
                     return
                 yield history + [user_msg, {"role": "assistant", "content": "🤔 Thinking..."}], ""
                 final_answer = "🤔 Thinking..."
-                for chunk in query_backend(message):
+                # current_docs is a list (possibly empty = search all)
+                for chunk in query_backend(message, current_docs):
                     final_answer = chunk
                     yield history + [user_msg, {"role": "assistant", "content": final_answer}], ""
 
-            # Returns (indexed?, filename, char_count, display_md, preview_text)
-            def _after_index(success, filename, char_count, source_text, error_msg=""):
+            def _after_index(success, doc_id, char_count, source_text, error_msg=""):
+                """
+                Shared post-index handler.
+                Returns: (indexed, docs, active_docs, index_status, preview_box, dropdown_update)
+                The freshly-uploaded doc is added to the active selection.
+                """
                 if success:
-                    display = update_index_display(filename, success, char_count)
+                    docs = fetch_indexed_docs()
+                    new_active = [doc_id] if doc_id in docs else docs[:]
+                    display = update_index_display(docs)
                     preview = source_text or ""
+                    return (
+                        True,
+                        docs,
+                        new_active,
+                        display,
+                        preview,
+                        gr.update(choices=docs, value=new_active),
+                    )
                 else:
                     display = error_msg or "📄 *No document indexed yet*"
-                    preview = ""
-                return success, filename, char_count, display, preview
+                    return False, gr.update(), gr.update(), display, "", gr.update()
 
-            # ── Section 1: Select files to index ──────────────────────────
+            # ── Section 1: Select files to index ──
             with gr.Accordion("📥 1. Select files to index", open=True):
                 with gr.Tabs():
-                    # — Tab A: sample files —
                     with gr.Tab("📋 Sample reports"):
                         sample_selector = gr.CheckboxGroup(
                             choices=list(SAMPLE_LABELS.keys()),
@@ -531,7 +212,6 @@ def create_app() -> gr.Blocks:
                         load_samples_btn = gr.Button("🚀 Index Selected Reports", variant="primary")
                         samples_status = gr.Markdown("")
 
-                    # — Tab B: paste text —
                     with gr.Tab("✏️ Paste text"):
                         paste_input = gr.Textbox(
                             label="Paste text here",
@@ -547,23 +227,37 @@ def create_app() -> gr.Blocks:
                         load_paste_btn = gr.Button("🚀 Index Pasted Text", variant="primary")
                         paste_status = gr.Markdown("")
 
-                    # — Tab C: upload file (no button — auto-indexes on upload) —
                     with gr.Tab("📁 Upload file"):
                         file_input = gr.File(
-                            label="Upload .txt, .pdf, or .docx",
+                            label="Upload .txt, .pdf, or .docx (one or many)",
                             file_types=[".txt", ".pdf", ".docx"],
-                            file_count="single",
+                            file_count="multiple",
                         )
                         gr.Markdown(
-                            "<small style='color:#888'>PDF and DOCX are parsed in-browser; "
-                            "only the extracted text is sent to the backend. "
-                            "Indexing starts automatically once a file is selected.</small>"
+                            "<small style='color:#888'>Drop one or more files at once. "
+                            "PDF and DOCX are parsed locally; only the extracted text is sent. "
+                            "Indexing starts automatically.</small>"
                         )
                         upload_status = gr.Markdown("")
 
-            # ── Section 2: Preview indexed text ───────────────────────────
+            # ── Document Selector (multi-select for query scope) ──
+            with gr.Row():
+                active_doc_dropdown = gr.Dropdown(
+                    label="📂 Documents to query (also targets for Remove)",
+                    choices=[],
+                    value=[],
+                    multiselect=True,
+                    interactive=True,
+                    scale=5,
+                    info="Leave empty to search across ALL indexed documents.",
+                )
+                refresh_docs_btn = gr.Button("🔄 Refresh", scale=1, min_width=80)
+                delete_doc_btn   = gr.Button("🗑️ Remove selected", scale=1, min_width=120, variant="stop")
+            delete_status = gr.Markdown("")
+
+            # ── Section 2: Preview indexed text ──
             with gr.Accordion("📖 2. Preview indexed text", open=True):
-                index_status = gr.Markdown("📄 *No document indexed yet*")
+                index_status = gr.Markdown("📄 *No documents indexed yet*")
                 preview_box = gr.Textbox(
                     value="",
                     lines=18,
@@ -573,7 +267,7 @@ def create_app() -> gr.Blocks:
                     placeholder="Index a document in section 1 to see its content here.",
                 )
 
-            # ── Section 3: Chat ────────────────────────────────────────────
+            # ── Section 3: Chat ──
             with gr.Accordion("💬 3. Ask questions", open=True):
                 gr.Markdown("<small style='color:#888'>Quick questions:</small>")
                 with gr.Row():
@@ -591,148 +285,281 @@ def create_app() -> gr.Blocks:
                     )
                     send_btn = gr.Button("Send ▶", scale=1, variant="primary")
 
-            # ── Wiring for Section 1 actions ──────────────────────────────
+            INDEX_OUTPUTS = [
+                document_indexed,
+                indexed_docs,
+                active_docs,
+                index_status,
+                preview_box,
+                active_doc_dropdown,
+            ]
+
             SAMPLES_LABEL = "🚀 Index Selected Reports"
             PASTE_LABEL   = "🚀 Index Pasted Text"
 
             def _busy(label):
                 return gr.update(value=label, interactive=False)
 
-            def _ready(label):
+            def _ready_btn(label):
                 return gr.update(value=label, interactive=True)
 
-            # Outputs for each action (button OR status, then state, then index/preview)
-            # Samples & paste: [btn, status_md, indexed, filename, char_count, index_status, preview_box]
-            # Upload (no btn): [status_md, indexed, filename, char_count, index_status, preview_box]
-
             def _samples_action(selected_labels):
-                yield _busy("📖 Preparing reports..."), "📖 Preparing reports…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                yield _busy("📖 Preparing reports..."), "📖 Preparing reports…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
                 if not selected_labels:
-                    indexed, fn_used, cc, display, preview = _after_index(
-                        False, None, None, "", "⚠️ Please select at least one report."
-                    )
-                    yield _ready(SAMPLES_LABEL), "⚠️ Please select at least one report.", indexed, fn_used, cc, display, preview
+                    result = _after_index(False, None, None, "", "⚠️ Please select at least one report.")
+                    yield (_ready_btn(SAMPLES_LABEL), "⚠️ Please select at least one report.") + result
                     return
-                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                success, filename, char_count, msg = load_selected_samples(selected_labels)
-                source_text = build_preview_text(selected_labels)[0] if success else ""
-                indexed, fn_used, cc, display, preview = _after_index(
-                    success, filename, char_count, source_text, msg
-                )
+                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                success, doc_id, char_count, msg = load_selected_samples(selected_labels)
+                source_text = build_preview_text(selected_labels) if success else ""
+                result = _after_index(success, doc_id, char_count, source_text, msg)
                 final_status = "✅ Done." if success else msg
-                yield _ready(SAMPLES_LABEL), final_status, indexed, fn_used, cc, display, preview
+                yield (_ready_btn(SAMPLES_LABEL), final_status) + result
 
             load_samples_btn.click(
                 fn=_samples_action,
                 inputs=[sample_selector],
-                outputs=[load_samples_btn, samples_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[load_samples_btn, samples_status] + INDEX_OUTPUTS,
             )
 
             def _paste_action(text, filename):
-                yield _busy("📖 Preparing text..."), "📖 Preparing text…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                yield _busy("📖 Preparing text..."), "📖 Preparing text…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
                 if not text or not text.strip():
-                    indexed, fn_used, cc, display, preview = _after_index(
-                        False, None, None, "", "⚠️ Please paste some text first."
-                    )
-                    yield _ready(PASTE_LABEL), "⚠️ Please paste some text first.", indexed, fn_used, cc, display, preview
+                    result = _after_index(False, None, None, "", "⚠️ Please paste some text first.")
+                    yield (_ready_btn(PASTE_LABEL), "⚠️ Please paste some text first.") + result
                     return
-                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                success, fn_used, char_count, msg = upload_pasted_text(text, filename)
-                indexed, fn_used2, cc, display, preview = _after_index(
-                    success, fn_used, char_count, text if success else "", msg
-                )
+                yield _busy("📤 Uploading & indexing..."), "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                success, doc_id, char_count, msg = upload_pasted_text(text, filename)
+                result = _after_index(success, doc_id, char_count, text if success else "", msg)
                 final_status = "✅ Done." if success else msg
-                yield _ready(PASTE_LABEL), final_status, indexed, fn_used2, cc, display, preview
+                yield (_ready_btn(PASTE_LABEL), final_status) + result
 
             load_paste_btn.click(
                 fn=_paste_action,
                 inputs=[paste_input, paste_filename],
-                outputs=[load_paste_btn, paste_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[load_paste_btn, paste_status] + INDEX_OUTPUTS,
             )
 
-            def _upload_action(file_obj):
-                # 1) Parsing
-                yield "📖 Parsing file…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                path = _resolve_file_path(file_obj)
+            def _process_one_file(file_obj):
+                """Parse + upload one file. Returns (ok, doc_id, char_count, text, msg)."""
+                path = resolve_file_path(file_obj)
+                base = os.path.basename(path) if path else "?"
                 if not path:
-                    indexed, fn_used, cc, display, preview = _after_index(
-                        False, None, None, "", "❌ No file selected."
-                    )
-                    yield "❌ No file selected.", indexed, fn_used, cc, display, preview
-                    return
+                    return False, None, None, "", f"❌ {base}: no file selected."
                 if not os.path.exists(path):
-                    indexed, fn_used, cc, display, preview = _after_index(
-                        False, None, None, "", f"❌ File not found: {path}"
-                    )
-                    yield f"❌ File not found.", indexed, fn_used, cc, display, preview
-                    return
-                file_size = os.path.getsize(path)
-                if file_size > MAX_FILE_SIZE:
-                    indexed, fn_used, cc, display, preview = _after_index(
-                        False, None, None, "", f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}."
-                    )
-                    yield f"❌ File too large. Max {format_file_size(MAX_FILE_SIZE)}.", indexed, fn_used, cc, display, preview
-                    return
-
+                    return False, None, None, "", f"❌ {base}: not found."
+                if os.path.getsize(path) > MAX_FILE_SIZE:
+                    return False, None, None, "", f"❌ {base}: too large (max {format_file_size(MAX_FILE_SIZE)})."
                 text_content, err = extract_text_from_file(path)
                 if err or not text_content or not text_content.strip():
-                    err_msg = err or "❌ File is empty or no extractable text found."
-                    indexed, fn_used, cc, display, preview = _after_index(False, None, None, "", err_msg)
-                    yield err_msg, indexed, fn_used, cc, display, preview
-                    return
-
-                # 2) Uploading + indexing
-                yield "📤 Uploading & indexing…", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-                base = os.path.basename(path)
+                    return False, None, None, "", err or f"❌ {base}: empty or unreadable."
                 stem, _ext = os.path.splitext(base)
                 filename = f"{stem}.txt"
-                success, fn_used, char_count, msg = _upload_text(text_content, filename)
-                indexed, fn_used2, cc, display, preview = _after_index(
-                    success, fn_used, char_count, text_content if success else "", msg
-                )
-                final_status = f"✅ Indexed **{fn_used2}** ({char_count:,} characters)." if success else msg
-                yield final_status, indexed, fn_used2, cc, display, preview
+                success, doc_id, char_count, msg = upload_text_to_backend(text_content, filename)
+                if success:
+                    return True, doc_id, char_count, text_content, f"✅ {doc_id} ({char_count:,} chars)"
+                return False, None, None, "", f"❌ {filename}: {msg}"
 
-            # Trigger automatically when the user uploads a file
+            def _upload_action(file_objs):
+                """Handle one or many files. Yields progress then a final summary."""
+                # Normalise to a list — Gradio may pass a single file or a list.
+                if file_objs is None:
+                    files = []
+                elif isinstance(file_objs, list):
+                    files = file_objs
+                else:
+                    files = [file_objs]
+
+                if not files:
+                    yield ("❌ No files selected.",) + _after_index(
+                        False, None, None, "", "❌ No files selected.",
+                    )
+                    return
+
+                total = len(files)
+                line_log: list = []
+                newly_indexed: list = []   # doc_ids of successful uploads
+                last_text = ""
+
+                for i, fobj in enumerate(files, start=1):
+                    base = os.path.basename(resolve_file_path(fobj) or "?")
+                    yield (
+                        f"📖 [{i}/{total}] Parsing **{base}**…\n\n" + "\n".join(line_log),
+                        gr.update(), gr.update(), gr.update(),
+                        gr.update(), gr.update(), gr.update(),
+                    )
+                    ok, doc_id, _cc, text_content, msg = _process_one_file(fobj)
+                    line_log.append(msg)
+                    if ok:
+                        newly_indexed.append(doc_id)
+                        last_text = text_content
+                    yield (
+                        f"📤 [{i}/{total}] Done.\n\n" + "\n".join(line_log),
+                        gr.update(), gr.update(), gr.update(),
+                        gr.update(), gr.update(), gr.update(),
+                    )
+
+                # Final state — select ALL successfully uploaded docs (not just the last).
+                ok_count = len(newly_indexed)
+                fail_count = total - ok_count
+
+                if ok_count:
+                    all_docs = fetch_indexed_docs()
+                    selected = [d for d in newly_indexed if d in all_docs]
+                    if not selected:
+                        selected = all_docs[:]  # fallback
+                    final_tuple = (
+                        True,
+                        all_docs,
+                        selected,
+                        update_index_display(all_docs),
+                        last_text,
+                        gr.update(choices=all_docs, value=selected),
+                    )
+                else:
+                    final_tuple = _after_index(False, None, None, "", "❌ All uploads failed.")
+
+                header = (
+                    f"✅ Indexed {ok_count}/{total} file{'s' if total != 1 else ''}."
+                    if fail_count == 0
+                    else f"⚠️ Indexed {ok_count}/{total} ({fail_count} failed)."
+                )
+                final_status = header + "\n\n" + "\n".join(line_log)
+                yield (final_status,) + final_tuple
+
             file_input.upload(
                 fn=_upload_action,
                 inputs=[file_input],
-                outputs=[upload_status, document_indexed, indexed_filename, indexed_char_count, index_status, preview_box],
+                outputs=[upload_status] + INDEX_OUTPUTS,
+            ).then(
+                fn=lambda: gr.update(value=None),
+                outputs=[file_input],
             )
 
-            # Quick-question buttons: fill the textbox, then auto-submit
+            active_doc_dropdown.change(
+                fn=lambda d: d or [],
+                inputs=[active_doc_dropdown],
+                outputs=[active_docs],
+            )
+
+            def _refresh_panel(current_active):
+                """Re-fetch the doc list and keep selection where possible."""
+                docs = fetch_indexed_docs()
+                keep = [d for d in (current_active or []) if d in docs]
+                return gr.update(choices=docs, value=keep), keep
+
+            refresh_docs_btn.click(
+                fn=_refresh_panel,
+                inputs=[active_docs],
+                outputs=[active_doc_dropdown, active_docs],
+            )
+
+            def _delete_action(current_active):
+                """Delete every doc currently selected. Empty selection = no-op."""
+                current_active = current_active or []
+                if not current_active:
+                    yield (
+                        gr.update(),
+                        "⚠️ Select at least one document to remove.",
+                        gr.update(), gr.update(), gr.update(),
+                        gr.update(), gr.update(),
+                    )
+                    return
+
+                yield (
+                    gr.update(),
+                    f"🗑️ Removing {len(current_active)} document{'s' if len(current_active) != 1 else ''}...",
+                    gr.update(), gr.update(), gr.update(),
+                    gr.update(), gr.update(),
+                )
+
+                removed = []
+                failed = []
+                remaining: list = []
+                for name in current_active:
+                    ok, remaining, _msg = delete_document(name)
+                    (removed if ok else failed).append(name)
+
+                if removed and not failed:
+                    msg = f"🗑️ Removed {len(removed)} document{'s' if len(removed) != 1 else ''}."
+                elif removed and failed:
+                    msg = f"⚠️ Removed {len(removed)}, failed {len(failed)}."
+                else:
+                    msg = f"❌ Failed to remove {len(failed)} document{'s' if len(failed) != 1 else ''}."
+
+                new_active = remaining[:] if remaining else []
+                yield (
+                    gr.update(choices=remaining, value=new_active),
+                    msg,
+                    len(remaining) > 0,
+                    remaining,
+                    new_active,
+                    update_index_display(remaining),
+                    "" if not remaining else gr.update(),
+                )
+
+            delete_doc_btn.click(
+                fn=_delete_action,
+                inputs=[active_docs],
+                outputs=[
+                    active_doc_dropdown,
+                    delete_status,
+                    document_indexed,
+                    indexed_docs,
+                    active_docs,
+                    index_status,
+                    preview_box,
+                ],
+            )
+
             for btn, q in zip(q_btns, SAMPLE_QUESTIONS):
                 btn.click(
                     fn=lambda x=q: x,
                     outputs=[question_input],
                 ).then(
                     fn=respond,
-                    inputs=[question_input, chatbot, document_indexed],
+                    inputs=[question_input, chatbot, document_indexed, active_docs],
                     outputs=[chatbot, question_input],
                 )
 
             send_btn.click(
                 fn=respond,
-                inputs=[question_input, chatbot, document_indexed],
+                inputs=[question_input, chatbot, document_indexed, active_docs],
                 outputs=[chatbot, question_input],
             )
             question_input.submit(
                 fn=respond,
-                inputs=[question_input, chatbot, document_indexed],
+                inputs=[question_input, chatbot, document_indexed, active_docs],
                 outputs=[chatbot, question_input],
             )
 
-        # Page switch when warmup completes
         ready.change(
             fn=lambda r: (gr.update(visible=not r), gr.update(visible=r), "chat" if r else "warmup"),
             inputs=[ready],
             outputs=[warmup_page, chat_page, page],
         )
 
-        # Restore index state on page load
+        def _initial_load():
+            from utils import check_health
+            is_indexed, docs = check_health()
+            # Default: nothing selected → query searches across all documents.
+            return (
+                is_indexed,
+                docs,
+                [],
+                update_index_display(docs),
+                gr.update(choices=docs, value=[]),
+            )
+
         demo.load(
-            fn=load_index_state,
-            outputs=[document_indexed, indexed_filename, indexed_char_count, index_status],
+            fn=_initial_load,
+            outputs=[
+                document_indexed,
+                indexed_docs,
+                active_docs,
+                index_status,
+                active_doc_dropdown,
+            ],
         )
 
     return demo

@@ -139,7 +139,7 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
 *.md
-
+!README.md
 __pycache__/
 
 *.txt
